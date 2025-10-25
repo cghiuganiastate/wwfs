@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Boeing 747 Flight Simulator</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-family: Arial, sans-serif;
+            font-size: 16px;
+            text-align: left;
+        }
+        #hud div { margin: 2px 0; }
+        #pause { color: yellow; font-size: 20px; text-align: center; top: 20px; }
+        #legend {
+            position: absolute;
+            bottom: 10px;
+            width: 100%;
+            text-align: center;
+            color: yellow;
+            font-size: 14px;
+        }
+        #resetButton {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 10px;
+            background: rgba(0, 128, 255, 0.7);
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div id="hud">
+        <div id="pause">Paused: No</div>
+        <div id="speed">Speed: 0 m/s</div>
+        <div id="roll">Roll: 0°</div>
+        <div id="pitch">Pitch: 0°</div>
+        <div id="yaw">Yaw: 0°</div>
+        <div id="throttle">Throttle: 0%</div>
+        <div id="elevator">Elevator: 0°</div>
+        <div id="aileron">Aileron: 0°</div>
+        <div id="rudder">Rudder: 0°</div>
+        <div id="pos_n">North: 0m</div>
+        <div id="pos_e">East: 0m</div>
+        <div id="pos_z">Alt: 0m</div>
+        <div id="trim_e">Pitch Trim: 0°</div>
+        <div id="trim_a">Roll Trim: 0°</div>
+        <div id="trim_r">Yaw Trim: 0°</div>
+    </div>
+    <div id="legend">
+        Body Axes: Blue=Forward, Red=Right, Orange=Down | World Axes: Red=E, Green=Up, Blue=N (near origin) | 
+        Hold C+WASDQE to adjust trim; T=Reset Trim
+    </div>  
+    <button id="resetButton">Reset Aircraft</button>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.134.0/examples/js/loaders/STLLoader.js"></script>
+    <script>
+        // Math utilities
+        const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+        const degrees = (radians) => radians * 180 / Math.PI;
+        const radians = (degrees) => degrees * Math.PI / 180;
+
+        // Aircraft class
+        class Aircraft {
+            constructor() {
+                this.mass = 288500.0;
+                this.Ixx = 24.95e6;
+                this.Iyy = 44.87e6;
+                this.Izz = 67.11e6;
+                this.Ixz = -3.74e6;
+                this.Ixy = 0.0;
+                this.Iyz = 0.0;
+                this.S = 511.0;
+                this.b = 59.64;
+                this.c = 8.32;
+                this.rho = 0.653;
+                this.g = 9.81;
+                this.thrust_max = 1008000.0;
+                this.cg_x = 0.0;
+                this.cg_y = 0.0;
+                this.cg_z = 0.0;
+
+                this.CL0 = 0.12;
+                this.CL_alpha = 4.67;
+                this.CD0 = 0.020;
+                this.CD_alpha = 0.0;
+                this.Cy_beta = -0.90;
+                this.CM_alpha = -1.146;
+                this.CM_q = -20.7;
+                this.CM_de = -1.43-3;
+                this.Cl_beta = -0.193;
+                this.Cl_da = 0.26+.2;
+                this.Cl_p = -0.323;
+                this.Cl_r = 0.212;
+                this.Cn_beta = 0.147;
+                this.Cn_dr = 0.108+.2;
+                this.Cn_p = -0.0687;
+                this.Cn_r = -0.278;
+
+                this.state = new Float32Array(12);
+                const alpha0 = 0.118;
+                const V0 = 149.5;
+                this.state[0] = V0 * Math.cos(alpha0);
+                this.state[2] = V0 * Math.sin(alpha0);
+                this.state[7] = alpha0;
+                this.state[11] = -1000.0;
+
+                this.controls = new Float32Array([0.5, 0.0, 0.0, 0.0]);
+                this.initial_state = new Float32Array(this.state);
+                this.initial_controls = new Float32Array(this.controls);
+            }
+
+            derivatives(state, controls) {
+                const [u, v, w, p, q, r, phi, theta, psi, x, y, z] = state;
+                const [throt, de, da, dr] = controls;
+
+                const V = Math.sqrt(u * u + v * v + w * w) || 1e-6;
+                const alpha = Math.atan2(w, u);
+                const beta = Math.asin(v / V);
+
+                const thrust_x = throt * this.thrust_max;
+                const thrust_y = 0.0;
+                const thrust_z = 0.0;
+
+                const qdyn = 0.5 * this.rho * V * V;
+                const CL = this.CL0 + this.CL_alpha * alpha;
+                const CD = this.CD0 + this.CD_alpha * alpha;
+                const Cy = this.Cy_beta * beta;
+
+                const Cx = -CD * Math.cos(alpha) + CL * Math.sin(alpha);
+                const Cz = -CD * Math.sin(alpha) - CL * Math.cos(alpha);
+
+                const Xa = qdyn * this.S * Cx;
+                const Ya = qdyn * this.S * Cy;
+                const Za = qdyn * this.S * Cz;
+
+                const gx = -this.g * Math.sin(theta);
+                const gy = this.g * Math.cos(theta) * Math.sin(phi);
+                const gz = this.g * Math.cos(theta) * Math.cos(phi);
+
+                const du_dt = r * v - q * w + gx + (thrust_x + Xa) / this.mass;
+                const dv_dt = p * w - r * u + gy + Ya / this.mass;
+                const dw_dt = q * u - p * v + gz + Za / this.mass;
+
+                const Cl = this.Cl_beta * beta + this.Cl_da * da +
+                           this.Cl_p * (p * this.b / (2 * V)) +
+                           this.Cl_r * (r * this.b / (2 * V));
+                const Cm = this.CM_alpha * alpha +
+                           this.CM_q * (q * this.c / (2 * V)) +
+                           this.CM_de * de;
+                const Cn = this.Cn_beta * beta + this.Cn_dr * dr +
+                           this.Cn_p * (p * this.b / (2 * V)) +
+                           this.Cn_r * (r * this.b / (2 * V));
+
+                const L = qdyn * this.S * this.b * Cl;
+                const M = qdyn * this.S * this.c * Cm;
+                const N = qdyn * this.S * this.b * Cn;
+
+                const Hx = this.Ixx * p - this.Ixz * r;
+                const Hy = this.Iyy * q;
+                const Hz = -this.Ixz * p + this.Izz * r;
+
+                const xt_x = q * Hz - r * Hy;
+                const xt_y = r * Hx - p * Hz;
+                const xt_z = p * Hy - q * Hx;
+
+                const L_eff = L - xt_x;
+                const M_eff = M - xt_y;
+                const N_eff = N - xt_z;
+
+                const dq_dt = M_eff / this.Iyy;
+
+                const delta = this.Ixx * this.Izz - this.Ixz * this.Ixz;
+                const dp_dt = delta > 1e-6 ? (this.Izz * L_eff + this.Ixz * N_eff) / delta : 0;
+                const dr_dt = delta > 1e-6 ? (this.Ixx * N_eff + this.Ixz * L_eff) / delta : 0;
+
+                const cos_theta = Math.cos(theta);
+                let dphi_dt = 0, dtheta_dt = 0, dpsi_dt = 0;
+                if (Math.abs(cos_theta) > 1e-6) {
+                    dphi_dt = p + q * Math.sin(phi) * Math.tan(theta) + r * Math.cos(phi) * Math.tan(theta);
+                    dtheta_dt = q * Math.cos(phi) - r * Math.sin(phi);
+                    dpsi_dt = (q * Math.sin(phi) + r * Math.cos(phi)) / cos_theta;
+                }
+
+                const sp = Math.sin(phi), cp = Math.cos(phi);
+                const st = Math.sin(theta), ct = Math.cos(theta);
+                const sy = Math.sin(psi), cy = Math.cos(psi);
+
+                const R11 = ct * cy;
+                const R12 = sp * st * cy - cp * sy;
+                const R13 = cp * st * cy + sp * sy;
+                const R21 = ct * sy;
+                const R22 = sp * st * sy + cp * cy;
+                const R23 = cp * st * sy - sp * cy;
+                const R31 = -st;
+                const R32 = sp * ct;
+                const R33 = cp * ct;
+
+                const dx_dt = R11 * u + R12 * v + R13 * w;
+                const dy_dt = R21 * u + R22 * v + R23 * w;
+                const dz_dt = R31 * u + R32 * v + R33 * w;
+
+                return new Float32Array([
+                    du_dt, dv_dt, dw_dt, dp_dt, dq_dt, dr_dt,
+                    dphi_dt, dtheta_dt, dpsi_dt, dx_dt, dy_dt, dz_dt
+                ]);
+            }
+
+            rk4_integrate(dt, controls) {
+                const k1 = this.derivatives(this.state, controls);
+                const state2 = this.state.map((s, i) => s + 0.5 * dt * k1[i]);
+                const k2 = this.derivatives(state2, controls);
+                const state3 = this.state.map((s, i) => s + 0.5 * dt * k2[i]);
+                const k3 = this.derivatives(state3, controls);
+                const state4 = this.state.map((s, i) => s + dt * k3[i]);
+                const k4 = this.derivatives(state4, controls);
+
+                for (let i = 0; i < 12; i++) {
+                    this.state[i] += (dt / 6.0) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+                }
+
+                this.state[0] = clamp(this.state[0], -500, 500);
+                this.state[1] = clamp(this.state[1], -500, 500);
+                this.state[2] = clamp(this.state[2], -500, 500);
+                this.state[3] = clamp(this.state[3], -1, 1);
+                this.state[4] = clamp(this.state[4], -1, 1);
+                this.state[5] = clamp(this.state[5], -1, 1);
+                this.state[6] = Math.atan2(Math.sin(this.state[6]), Math.cos(this.state[6]));
+                this.state[7] = clamp(this.state[7], -Math.PI/2 + 0.1, Math.PI/2 - 0.1);
+                this.state[8] = Math.atan2(Math.sin(this.state[8]), Math.cos(this.state[8]));
+                this.state[9] = clamp(this.state[9], -1e6, 1e6);
+                this.state[10] = clamp(this.state[10], -1e6, 1e6);
+                this.state[11] = clamp(this.state[11], -1e6, 1e6);
+            }
+
+            reset() {
+                this.state = new Float32Array(this.initial_state);
+                this.controls = new Float32Array(this.initial_controls);
+            }
+        }
+
+        // GroundTileManager class
+        class GroundTileManager {
+            constructor(scene, tile_size = 5000, view_distance = 3) {
+                this.scene = scene;
+                this.tile_size = tile_size;
+                this.view_distance = view_distance;
+                this.tiles = new Map();
+                this.tile_geometry = new THREE.PlaneGeometry(tile_size, tile_size);
+                this.tile_material = new THREE.MeshLambertMaterial({ color: 0x00ff00 });
+            }
+
+            world_to_tile(east, north) {
+                return [Math.floor(east / this.tile_size), Math.floor(north / this.tile_size)];
+            }
+
+            update_tiles(aircraft_state) {
+                const [tile_east, tile_north] = this.world_to_tile(aircraft_state[10], aircraft_state[9]);
+                const new_tiles = new Map();
+
+                for (let de = -this.view_distance; de <= this.view_distance; de++) {
+                    for (let dn = -this.view_distance; dn <= this.view_distance; dn++) {
+                        const te = tile_east + de;
+                        const tn = tile_north + dn;
+                        const key = `${te},${tn}`;
+                        if (!this.tiles.has(key)) {
+                            const tile = new THREE.Mesh(this.tile_geometry, this.tile_material);
+                            tile.rotation.x = -Math.PI / 2;
+                            tile.position.set(te * this.tile_size, 0, tn * this.tile_size);
+                            this.scene.add(tile);
+                            this.tiles.set(key, tile);
+                        }
+                        new_tiles.set(key, this.tiles.get(key));
+                    }
+                }
+
+                for (let [key, tile] of this.tiles) {
+                    if (!new_tiles.has(key)) {
+                        this.scene.remove(tile);
+                        this.tiles.delete(key);
+                    }
+                }
+                this.tiles = new_tiles;
+            }
+        }
+
+        // Three.js setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 50000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        scene.background = new THREE.Color(0x87ceeb);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        directionalLight.position.set(100, 100, 30).normalize().multiplyScalar(100);
+        scene.add(directionalLight);
+        scene.add(new THREE.AmbientLight(0x404040));
+
+        const axes_length = 5000;
+        const axes_thickness = 20;
+        const axes_center = new THREE.Group();
+        axes_center.position.set(0, -500, 0);
+        scene.add(axes_center);
+
+        const x_axis = new THREE.Mesh(
+            new THREE.BoxGeometry(axes_length, axes_thickness, axes_thickness),
+            new THREE.MeshLambertMaterial({ color: 0xff0000 })
+        );
+        x_axis.position.set(axes_length / 2, 0, 0);
+        axes_center.add(x_axis);
+
+        const y_axis = new THREE.Mesh(
+            new THREE.BoxGeometry(axes_thickness, axes_length, axes_thickness),
+            new THREE.MeshLambertMaterial({ color: 0x00ff00 })
+        );
+        y_axis.position.set(0, axes_length / 2, 0);
+        axes_center.add(y_axis);
+
+        const z_axis = new THREE.Mesh(
+            new THREE.BoxGeometry(axes_thickness, axes_thickness, axes_length),
+            new THREE.MeshLambertMaterial({ color: 0x0000ff })
+        );
+        z_axis.position.set(0, 0, axes_length / 2);
+        axes_center.add(z_axis);
+
+        const aircraft = new Aircraft();
+        const plane_parent = new THREE.Group();
+        scene.add(plane_parent);
+
+        let plane;
+
+        const loader = new THREE.STLLoader();
+        loader.load('./747.stl', function (geometry) {
+            const material = new THREE.MeshLambertMaterial({ color: 0x00ffff });
+            plane = new THREE.Mesh(geometry, material);
+            // Adjust scale if needed; assuming the STL is in meters, scale down if too large
+            plane.scale.set(1, 1, 1); // Modify as necessary for your model size
+            plane_parent.add(plane);
+            plane.rotation.x = -Math.PI/2; // Uncomment to flip 180° on X-axis
+            plane.rotation.z = Math.PI/2; // Uncomment to
+            // Add body axes indicators to the plane model
+            const body_forward = new THREE.Mesh(
+                new THREE.BoxGeometry(20, 0.2, 0.2),
+                new THREE.MeshLambertMaterial({ color: 0x0000ff })
+            );
+            body_forward.position.set(10, 0, 0);
+            plane.add(body_forward);
+
+            const body_right = new THREE.Mesh(
+                new THREE.BoxGeometry(0.2, 20, 0.2),
+                new THREE.MeshLambertMaterial({ color: 0xff0000 })
+            );
+            body_right.position.set(0, 10, 0);
+            plane.add(body_right);
+
+            const body_down = new THREE.Mesh(
+                new THREE.BoxGeometry(0.2, 0.2, 10),
+                new THREE.MeshLambertMaterial({ color: 0xffa500 })
+            );
+            body_down.position.set(0, 0, 5);
+            plane.add(body_down);
+        }, undefined, function (error) {
+            console.error('Error loading STL file:', error);
+            // Fallback to box if STL fails to load
+            const plane_geometry = new THREE.BoxGeometry(20, 1, 0.5);
+            const plane_material = new THREE.MeshLambertMaterial({ color: 0x00ffff });
+            plane = new THREE.Mesh(plane_geometry, plane_material);
+            plane_parent.add(plane);
+
+            const body_forward = new THREE.Mesh(
+                new THREE.BoxGeometry(20, 0.2, 0.2),
+                new THREE.MeshLambertMaterial({ color: 0x0000ff })
+            );
+            body_forward.position.set(10, 0, 0);
+            plane.add(body_forward);
+
+            const body_right = new THREE.Mesh(
+                new THREE.BoxGeometry(0.2, 20, 0.2),
+                new THREE.MeshLambertMaterial({ color: 0xff0000 })
+            );
+            body_right.position.set(0, 10, 0);
+            plane.add(body_right);
+
+            const body_down = new THREE.Mesh(
+                new THREE.BoxGeometry(0.2, 0.2, 10),
+                new THREE.MeshLambertMaterial({ color: 0xffa500 })
+            );
+            body_down.position.set(0, 0, 5);
+            plane.add(body_down);
+        });
+
+        const ground_manager = new GroundTileManager(scene);
+
+        let throttle = 0.5, elevator = 0.0, aileron = 0.0, rudder = 0.0;
+        let trim_e = 0.0, trim_a = 0.0, trim_r = 0.0;
+        let cam_distance = 140.0, cam_azimuth = 180.0, cam_elevation = -10.0, cam_roll = 0.0;
+        let paused = false;
+
+        const keys = {};
+        document.addEventListener('keydown', (e) => {
+            keys[e.key.toLowerCase()] = true;
+            if (e.key.toLowerCase() === 'p') paused = !paused;
+            if (e.key.toLowerCase() === 'r') reset_aircraft();
+            if (e.key.toLowerCase() === 't') reset_trim();
+        });
+        document.addEventListener('keyup', (e) => {
+            keys[e.key.toLowerCase()] = false;
+        });
+
+        function reset_aircraft() {
+            aircraft.reset();
+            throttle = 0.5;
+            elevator = 0.0;
+            aileron = 0.0;
+            rudder = 0.0;
+            reset_trim();
+        }
+
+        function reset_trim() {
+            trim_e = 0.0;
+            trim_a = 0.0;
+            trim_r = 0.0;
+        }
+
+        document.getElementById('resetButton').addEventListener('click', reset_aircraft);
+
+        // Update controls function (replace 'alt' with 'c')
+        function update_controls(dt) {
+            const control_rate = 0.005;
+            const trim_rate = 0.002;
+            const c_held = keys['c']; // Changed from keys['alt']
+
+            if (keys['w']) {
+                if (c_held) trim_e = Math.min(0.5, trim_e + trim_rate);
+                else elevator = Math.min(0.5, elevator + control_rate);
+            }
+            if (keys['s']) {
+                if (c_held) trim_e = Math.max(-0.5, trim_e - trim_rate);
+                else elevator = Math.max(-0.5, elevator - control_rate);
+            }
+            if (keys['a']) {
+                if (c_held) trim_a = Math.max(-0.5, trim_a - trim_rate);
+                else aileron = Math.max(-0.5, aileron - control_rate);
+            }
+            if (keys['d']) {
+                if (c_held) trim_a = Math.min(0.5, trim_a + trim_rate);
+                else aileron = Math.min(0.5, aileron + control_rate);
+            }
+            if (keys['q']) {
+                if (c_held) trim_r = Math.max(-0.5, trim_r - trim_rate);
+                else rudder = Math.max(-0.5, rudder - control_rate);
+            }
+            if (keys['e']) {
+                if (c_held) trim_r = Math.min(0.5, trim_r + trim_rate);
+                else rudder = Math.min(0.5, rudder + control_rate);
+            }
+            if (keys['shift']) throttle = Math.min(1.0, throttle + control_rate * 2);
+            if (keys['control']) throttle = Math.max(0.0, throttle - control_rate * 2);
+
+            elevator *= 0.95;
+            aileron *= 0.98;
+            rudder *= 0.98;
+
+            aircraft.controls = new Float32Array([throttle, elevator + trim_e, aileron + trim_a, rudder + trim_r]);
+        }
+
+        let last_time = performance.now();
+        function animate() {
+            requestAnimationFrame(animate);
+            const current_time = performance.now();
+            const dt = Math.min((current_time - last_time) / 1000, 0.1);
+            last_time = current_time;
+
+            if (!paused) {
+                update_controls(dt);
+                aircraft.rk4_integrate(dt, aircraft.controls);
+            }
+
+            ground_manager.update_tiles(aircraft.state);
+
+            const state = aircraft.state;
+            plane_parent.position.set(state[10], -state[11], state[9]);
+            plane_parent.rotation.order = 'YXZ';
+            plane_parent.rotation.set(-state[7], state[8], state[6]);
+
+            const elevation_rate = 40.0, azimuth_rate = 40.0, roll_rate = 40.0;
+            if (keys['8']) cam_elevation -= elevation_rate * dt; // Pitch up
+            if (keys['2']) cam_elevation += elevation_rate * dt; // Pitch down
+            if (keys['4']) cam_azimuth += azimuth_rate * dt;    // Yaw left
+            if (keys['6']) cam_azimuth -= azimuth_rate * dt;    // Yaw right
+            if (keys['1']) cam_roll += roll_rate * dt;
+            if (keys['7']) cam_roll -= roll_rate * dt;
+            if (keys['9']) cam_distance = Math.max(10, cam_distance - 50 * dt);
+            if (keys['3']) cam_distance = Math.min(500, cam_distance + 50 * dt);
+            if (keys['5']) {
+                cam_azimuth = 180.0; // Behind aircraft
+                cam_elevation = -10.0;
+                cam_distance = 140.0;
+                cam_roll = 0.0;
+            }
+            cam_elevation = clamp(cam_elevation, -89, 89);
+
+            // Camera position: behind (-x) and slightly above (-z) in body frame
+            const az = radians(cam_azimuth);
+            const el = radians(cam_elevation);
+            const cos_el = Math.cos(el) || (el >= 0 ? 1e-6 : -1e-6);
+            const sin_az = Math.sin(az);
+            const cos_az = Math.cos(az);
+            const sin_el = Math.sin(el);
+
+            // Body frame vectors
+            const forward = new THREE.Vector3(0, 0, -1).applyEuler(plane_parent.rotation); // +x = forward (orange)
+            const right = new THREE.Vector3(1, 0, 0).applyEuler(plane_parent.rotation);   // +y = left (blue)
+            const down = new THREE.Vector3(0, 1, 0).applyEuler(plane_parent.rotation);     // +z = up (red)
+
+            // Camera offset: adjust azimuth reference to ensure 180° is behind
+            const local_rel = forward.clone().multiplyScalar(-cam_distance * cos_el * cos_az) // Behind
+                .add(right.multiplyScalar(-cam_distance * cos_el * sin_az))                   // Lateral (negate for left)
+                .add(down.multiplyScalar(-cam_distance * sin_el));                            // Up
+
+            camera.position.copy(plane_parent.position).add(local_rel);
+            camera.lookAt(plane_parent.position);
+            camera.rotation.z += radians(cam_roll); // Apply roll after lookAt
+
+            // Update HUD
+            const V = Math.sqrt(state[0]**2 + state[1]**2 + state[2]**2);
+            document.getElementById('speed').textContent = `Speed: ${V.toFixed(1)} m/s`;
+            document.getElementById('roll').textContent = `Roll: ${degrees(state[6]).toFixed(1)}°`;
+            document.getElementById('pitch').textContent = `Pitch: ${degrees(state[7]).toFixed(1)}°`;
+            document.getElementById('yaw').textContent = `Yaw: ${degrees(state[8]).toFixed(1)}°`;
+            document.getElementById('throttle').textContent = `Throttle: ${(throttle * 100).toFixed(0)}%`;
+            document.getElementById('elevator').textContent = `Elevator: ${degrees(elevator).toFixed(1)}°`;
+            document.getElementById('aileron').textContent = `Aileron: ${degrees(aileron).toFixed(1)}°`;
+            document.getElementById('rudder').textContent = `Rudder: ${degrees(rudder).toFixed(1)}°`;
+            document.getElementById('pos_n').textContent = `North: ${state[9].toFixed(0)}m`;
+            document.getElementById('pos_e').textContent = `East: ${state[10].toFixed(0)}m`;
+            document.getElementById('pos_z').textContent = `Alt: ${-state[11].toFixed(0)}m`;
+            document.getElementById('trim_e').textContent = `Pitch Trim: ${degrees(trim_e).toFixed(1)}°`;
+            document.getElementById('trim_a').textContent = `Roll Trim: ${degrees(trim_a).toFixed(1)}°`;
+            document.getElementById('trim_r').textContent = `Yaw Trim: ${degrees(trim_r).toFixed(1)}°`;
+            document.getElementById('pause').textContent = `Paused: ${paused ? 'Yes' : 'No'}`;
+
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
